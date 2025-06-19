@@ -1,0 +1,5 @@
+numpy
+sounddevice
+# Choose one of the following whisper implementations:
+# openai-whisper  # Original implementation (may have installation issues)
+faster-whisper   # Faster and more efficient alternative (recommended)
