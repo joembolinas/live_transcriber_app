@@ -7,9 +7,9 @@ import queue
 import time
 
 # --- Configuration ---
-MODEL_SIZE = "base"  # "tiny", "base", "small", "medium", "large"
+MODEL_SIZE = "small"  # "tiny", "base", "small", "medium", "large" - using small for better accuracy
 SAMPLE_RATE = 16000  # Whisper prefers 16kHz
-CHUNK_DURATION_SECONDS = 5  # Process audio in chunks of this duration
+CHUNK_DURATION_SECONDS = 8  # Longer chunks for complete sentences
 CHANNELS = 1
 
 # --- Global Variables ---
@@ -45,14 +45,27 @@ except ImportError:
 def list_audio_devices():
     devices = sd.query_devices()
     input_devices = {f"{i}: {dev['name']}": i for i, dev in enumerate(devices) if dev['max_input_channels'] > 0}
-    # Try to find a loopback device for convenience
+    
+    # Prioritize device selection: 1. Microphone, 2. CABLE Output, 3. Stereo Mix
     default_device_name = None
-    for name, idx in input_devices.items():
-        if "loopback" in name.lower() or "stereo mix" in name.lower() or "what u hear" in name.lower():
-            default_device_name = name
+    device_priority = [
+        ('microphone', 'mic'),  # Regular microphones
+        ('cable output', 'cable'),  # VB-Audio Cable
+        ('stereo mix', 'loopback', 'what u hear')  # System audio capture
+    ]
+    
+    for priority_keywords in device_priority:
+        for name, idx in input_devices.items():
+            name_lower = name.lower()
+            if any(keyword in name_lower for keyword in priority_keywords):
+                default_device_name = name
+                break
+        if default_device_name:
             break
+    
     if not default_device_name and input_devices:
-        default_device_name = list(input_devices.keys())[0] # Fallback to first mic
+        default_device_name = list(input_devices.keys())[0] # Fallback to first device
+    
     return input_devices, default_device_name
 
 def audio_callback(indata, frames, time, status):
@@ -183,27 +196,121 @@ def process_transcription():
             stop_listening_event.set()
             return
 
+    # Add timeout counter for no audio detection
+    no_audio_counter = 0
+    max_no_audio_warnings = 3
+
     while not stop_listening_event.is_set() or not audio_queue.empty():
         try:
             audio_data_chunk = audio_queue.get(timeout=1)
             
-            # Convert to float32, Whisper expects this
+            # Convert to float32 and preprocess audio
             audio_float32 = audio_data_chunk.astype(np.float32).flatten()
+            
+            # Simple noise reduction: apply gentle high-pass filter to reduce low-frequency noise
+            if len(audio_float32) > 1000:  # Only for reasonably sized chunks
+                # Remove DC offset
+                audio_float32 = audio_float32 - np.mean(audio_float32)
+                
+                # Normalize volume (but don't amplify too much)
+                max_amplitude = np.max(np.abs(audio_float32))
+                if max_amplitude > 0.001:  # Only normalize if there's significant signal
+                    audio_float32 = audio_float32 * min(0.7 / max_amplitude, 3.0)  # Limit amplification
+            
+            # Check audio level for debugging
+            volume_level = np.sqrt(np.mean(audio_float32**2))
+            if volume_level > 0.01:  # Significant audio for transcription
+                transcript_queue.put(f"[DEBUG] Strong audio - Volume: {volume_level:.4f}\n")
+                no_audio_counter = 0  # Reset counter when audio is detected
+            elif volume_level > 0.001:  # Audible but may be too quiet
+                transcript_queue.put(f"[DEBUG] Weak audio - Volume: {volume_level:.4f} (may be too quiet)\n")
+                no_audio_counter = 0  # Reset counter for any audio
+            else:
+                # No audio detected, skip transcription
+                no_audio_counter += 1
+                if no_audio_counter <= max_no_audio_warnings:
+                    if no_audio_counter == 1:
+                        transcript_queue.put(f"[INFO] Waiting for audio... (Volume level: {volume_level:.6f})\n")
+                    elif no_audio_counter == max_no_audio_warnings:
+                        transcript_queue.put(f"[WARNING] Audio too quiet for reliable transcription.\n")
+                        transcript_queue.put(f"[HELP] Try:\n")
+                        transcript_queue.put(f"       1. Speaking louder or moving closer to microphone\n")
+                        transcript_queue.put(f"       2. Increasing microphone volume in Windows settings\n")
+                        transcript_queue.put(f"       3. Using a different microphone\n")
+                continue
+
+            # Only transcribe if we have sufficient audio
+            if volume_level < 0.01:  # Increase threshold for better quality
+                continue
 
             # Transcribe using the appropriate method
             if use_faster_whisper:
-                segments, info = whisper_model.transcribe(audio_float32, language=None)
-                detected_language = info.language
+                # Optimized settings for better accuracy
+                segments, info = whisper_model.transcribe(
+                    audio_float32, 
+                    language='en',  # Force English
+                    beam_size=5,    # Better accuracy
+                    best_of=5,      # Multiple candidates
+                    temperature=0.0, # Deterministic output
+                    condition_on_previous_text=False,  # Don't use previous context
+                    initial_prompt="",  # Remove prompt that was causing repetition
+                    vad_filter=True,  # Voice activity detection to filter silence
+                    vad_parameters=dict(min_silence_duration_ms=300),  # Shorter silence threshold
+                    word_timestamps=True  # Get word-level timestamps for better accuracy
+                )
+                detected_language = 'en'  # Force English
                 text = " ".join([segment.text for segment in segments]).strip()
             else:
-                result = whisper_model.transcribe(audio_float32, fp16=False)
-                detected_language = result['language']
+                result = whisper_model.transcribe(
+                    audio_float32, 
+                    language='en',  # Force English
+                    fp16=False,
+                    temperature=0.0,
+                    condition_on_previous_text=False
+                )
+                detected_language = 'en'  # Force English
                 text = result['text'].strip()
 
-            if not text: # Skip empty transcriptions
+            if not text or len(text.strip()) < 5: # Skip very short/empty transcriptions
+                transcript_queue.put(f"[DEBUG] Transcription too short or empty (volume: {volume_level:.4f})\n")
                 continue
 
-            final_text = f"[{detected_language.upper()}] {text}"
+            # Clean up the text and filter out repetitive patterns
+            text = text.strip()
+            
+            # Remove common transcription artifacts and repetitions
+            artifacts = [
+                "The following is a clear speech recording",
+                "The following is a clear speech recording of",
+                "Thank you for watching",
+                "Thanks for watching"
+            ]
+            
+            for artifact in artifacts:
+                text = text.replace(artifact, "").strip()
+            
+            # Filter out repetitive words (like the "check, check, check..." issue)
+            words = text.split()
+            if len(words) > 8:  # Only check for repetition in longer texts
+                # Check if more than 40% of words are the same (reduced threshold)
+                word_counts = {}
+                for word in words:
+                    word_lower = word.lower().strip('.,!?')
+                    if len(word_lower) > 2:  # Only count words longer than 2 characters
+                        word_counts[word_lower] = word_counts.get(word_lower, 0) + 1
+                
+                if word_counts:
+                    most_common_count = max(word_counts.values())
+                    if most_common_count > len(words) * 0.4:  # Reduced from 50% to 40%
+                        transcript_queue.put(f"[DEBUG] Filtered repetitive transcription (volume: {volume_level:.4f})\n")
+                        continue
+            
+            # Skip if the text is still too short after cleanup
+            if len(text.strip()) < 5:
+                transcript_queue.put(f"[DEBUG] Text too short after cleanup (volume: {volume_level:.4f})\n")
+                continue
+            
+            final_text = f"[EN] {text}"
 
             if detected_language == 'tl': # Tagalog
                 transcript_queue.put(f"[INFO] Tagalog detected. Translating to English...\n")
@@ -269,10 +376,18 @@ class Application(tk.Frame):
             messagebox.showerror("Audio Error", "No input audio devices found! Please check your microphone/system audio settings.")
             self.listen_button.config(state=tk.DISABLED)
         else:
-            self.device_var.set(default_device if default_device else list(self.input_devices.keys())[0])
+            # Set default device
+            if default_device and default_device in self.input_devices:
+                self.device_var.set(default_device)
+            else:
+                self.device_var.set(list(self.input_devices.keys())[0])
+                
+            # Populate device menu
             self.device_menu['menu'].delete(0, 'end')
             for device_name in self.input_devices.keys():
                 self.device_menu['menu'].add_command(label=device_name, command=tk._setit(self.device_var, device_name))
+            
+            # Initialize the selected device
             self.on_device_select()
 
     def create_widgets(self):
@@ -288,10 +403,17 @@ class Application(tk.Frame):
         self.save_button.pack(side=tk.LEFT, padx=(0,10))
         
         # Device Selection
-        tk.Label(controls_frame, text="Audio Device:").pack(side=tk.LEFT, padx=(10,5))
+        device_frame = tk.Frame(controls_frame)
+        device_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10,0))
+        
+        tk.Label(device_frame, text="Audio Device:").pack(side=tk.TOP, anchor=tk.W)
         self.device_var = StringVar(self.master)
-        self.device_menu = OptionMenu(controls_frame, self.device_var, "No devices found", command=self.on_device_select_event)
-        self.device_menu.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.device_menu = OptionMenu(device_frame, self.device_var, "No devices found", command=self.on_device_select_event)
+        self.device_menu.pack(side=tk.TOP, fill=tk.X)
+        
+        # Device type hint
+        self.device_hint = tk.Label(device_frame, text="", fg="gray", font=("Arial", 8))
+        self.device_hint.pack(side=tk.TOP, anchor=tk.W)
 
         # Status info
         if not whisper_available:
@@ -316,22 +438,45 @@ class Application(tk.Frame):
         if self.input_devices and selected_name in self.input_devices:
             selected_device_id = self.input_devices[selected_name]
             print(f"Selected audio device: {selected_name} (ID: {selected_device_id})")
+            
+            # Update device hint
+            name_lower = selected_name.lower()
+            if 'microphone' in name_lower or 'mic' in name_lower:
+                self.device_hint.config(text="🎤 Microphone - Speak to test")
+            elif 'cable output' in name_lower:
+                self.device_hint.config(text="🔊 System Audio - Play music/video to test")
+            elif 'stereo mix' in name_lower:
+                self.device_hint.config(text="🔊 System Audio - Ensure Stereo Mix is enabled")
+            else:
+                self.device_hint.config(text="🎧 Audio Input Device")
+            
             if is_listening:
                 self.stop_listening_actions()
                 self.start_listening_actions()
         elif not self.input_devices:
             selected_device_id = None
+            self.device_hint.config(text="❌ No devices available")
             print("No input devices available for selection.")
         else:
             selected_device_id = None
+            self.device_hint.config(text="⚠️ Device not found")
             print(f"Warning: Selected device '{selected_name}' not found in cached list.")
 
     def toggle_listening(self):
         global is_listening, recording_thread, transcription_thread
 
-        if not selected_device_id and not is_listening:
-             messagebox.showerror("Device Error", "Please select a valid audio input device first.")
-             return
+        # Check if we have a valid device selected or can auto-detect one
+        if not is_listening:
+            selected_name = self.device_var.get()
+            if not selected_name or selected_name == "No devices found":
+                messagebox.showerror("Device Error", "Please select a valid audio input device first.")
+                return
+            
+            # Ensure the selected device is properly mapped
+            if selected_name in self.input_devices:
+                global selected_device_id
+                selected_device_id = self.input_devices[selected_name]
+                print(f"Using device: {selected_name} (ID: {selected_device_id})")
 
         if is_listening:
             self.stop_listening_actions()
@@ -341,10 +486,12 @@ class Application(tk.Frame):
     def start_listening_actions(self):
         global is_listening, recording_thread, transcription_thread, audio_queue, transcript_queue
         
-        # Allow starting even without device selected - will auto-find
-        # if not selected_device_id:
-        #     messagebox.showwarning("No Device", "Cannot start listening. No audio device is properly selected.")
-        #     return
+        # Ensure we have a valid device selected
+        selected_name = self.device_var.get()
+        if selected_name and selected_name in self.input_devices:
+            global selected_device_id
+            selected_device_id = self.input_devices[selected_name]
+            print(f"Starting with device: {selected_name} (ID: {selected_device_id})")
 
         is_listening = True
         stop_listening_event.clear()
